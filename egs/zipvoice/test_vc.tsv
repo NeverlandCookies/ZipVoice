@@ -1,0 +1,9 @@
+# Test file for ZipVoice Voice Conversion
+# Format: sample_id	source_audio_path	target_audio_path
+# 
+# Example entries (you need to replace with actual audio file paths):
+# test_001	/path/to/source1.wav	/path/to/target1.wav
+# test_002	/path/to/source2.wav	/path/to/target2.wav
+#
+# For LibriTTS testing, you can use:
+# test_libritts_001	data/LibriTTS/train-clean-100/1001/134707/1001_134707_000001_000000.wav	data/LibriTTS/train-clean-100/1002/135805/1002_135805_000001_000000.wav
