@@ -64,6 +64,9 @@ from zipvoice.tokenizer.tokenizer import (
     LibriTTSTokenizer,
     SimpleTokenizer,
 )
+
+from zipvoice.tokenizer.s3_tokenizer import S3SpeechTokenizer   # 新增导入
+
 from zipvoice.utils.checkpoint import (
     load_checkpoint,
     remove_checkpoints,
@@ -307,8 +310,8 @@ def get_parser():
     parser.add_argument(
         "--dataset",
         type=str,
-        default="emilia",
-        choices=["emilia", "libritts", "custom"],
+        default="libritts-clean100",    # 更换默认值
+        choices=["emilia", "libritts", "libritts-clean100", "libritts-clean360", "libritts-other500", "custom"],    # 新增libritts-clean100, libritts-clean360, libritts-other500
         help="The used training dataset",
     )
 
@@ -348,8 +351,8 @@ def get_parser():
     parser.add_argument(
         "--tokenizer",
         type=str,
-        default="emilia",
-        choices=["emilia", "libritts", "espeak", "simple"],
+        default="s3",   # 更换默认值
+        choices=["s3", "emilia", "libritts", "espeak", "simple"],    # 新增s3
         help="Tokenizer type.",
     )
 
@@ -729,13 +732,28 @@ def compute_validation_loss(
 ) -> MetricsTracker:
     """Run the validation process."""
 
+    # ===== 新增：验证前同步 =====
+    if world_size > 1:
+        torch.distributed.barrier()
+
     model.eval()
     device = model.device if isinstance(model, DDP) else next(model.parameters()).device
 
     # used to summary the stats over iterations
     tot_loss = MetricsTracker()
 
+    # ===== 新增: 限制验证 batch 数量，避免耗时过长 =====
+    max_valid_batches = 50  # 最多验证 50 个 batch（可根据需要调整）
+    sync_interval = 10  # 每 10 个 batch 同步一次
+
     for batch_idx, batch in enumerate(valid_dl):
+
+        # ===== 新增：限制验证数量 =====
+        if batch_idx >= max_valid_batches:
+            if world_size > 1 and torch.distributed.get_rank() == 0:
+                logging.info(f"Validation: limiting to {max_valid_batches} batches to avoid timeout")
+            break
+
         tokens, features, features_lens = prepare_input(
             params=params,
             batch=batch,
@@ -755,8 +773,17 @@ def compute_validation_loss(
         assert loss.requires_grad is False
         tot_loss = tot_loss + loss_info
 
+        # ===== 修改3: 定期同步，避免长时间无通信 =====
+        if world_size > 1 and (batch_idx + 1) % sync_interval == 0:
+            torch.distributed.barrier()
+
     if world_size > 1:
+        torch.distributed.barrier()  # 新增：reduce 前同步
         tot_loss.reduce(loss.device)
+        torch.distributed.barrier()  # 新增：reduce 后同步
+    else:
+        # 单 GPU 不需要 reduce
+        pass
 
     loss_value = tot_loss["loss"]
     if loss_value < params.best_valid_loss:
@@ -850,10 +877,36 @@ def scan_pessimistic_batches_for_oom(
 
 def tokenize_text(c: Cut, tokenizer):
     if hasattr(c.supervisions[0], "tokens"):
-        tokens = tokenizer.tokens_to_token_ids([c.supervisions[0].tokens])
+        # 有预计算的 tokens
+        if isinstance(tokenizer, S3SpeechTokenizer):
+            # S3SpeechTokenizer：tokens 已经是 List[int]（来自预计算）
+            tokens = [c.supervisions[0].tokens]
+        else:
+            # 文本 tokenizer：tokens 是 List[str]，需要转换为 token_ids
+            tokens = tokenizer.tokens_to_token_ids([c.supervisions[0].tokens])
     else:
-        tokens = tokenizer.texts_to_token_ids([c.supervisions[0].text])
-    c.supervisions[0].tokens = tokens[0]
+        # 没有预计算的 tokens，on-the-fly 提取
+        if isinstance(tokenizer, S3SpeechTokenizer):
+            # S3SpeechTokenizer：从音频路径提取 token_ids
+            audio_path = None
+            try:
+                srcs = getattr(c.recording, "sources", [])
+                if srcs:
+                    audio_path = getattr(srcs[0], "source", None)
+            except Exception as e:
+                logging.warning(f"Failed to get audio path from cut {c.id}: {e}")
+                return c
+
+            if audio_path is None:
+                logging.warning(f"No audio path found for cut {c.id}")
+                return c
+
+            tokens = tokenizer.speech_to_token_ids([str(audio_path)])
+        else:
+            # 文本 tokenizer：从文本提取 token_ids
+            tokens = tokenizer.texts_to_token_ids([c.supervisions[0].text])
+
+    c.supervisions[0].tokens = tokens[0]  # 取出内层 list
     return c
 
 
@@ -906,6 +959,8 @@ def run(rank, world_size, args):
         tokenizer = LibriTTSTokenizer(token_file=params.token_file)
     elif params.tokenizer == "espeak":
         tokenizer = EspeakTokenizer(token_file=params.token_file, lang=params.lang)
+    elif params.tokenizer == "s3":  # 新增s3 tokenizer
+        tokenizer = S3SpeechTokenizer()
     else:
         assert params.tokenizer == "simple"
         tokenizer = SimpleTokenizer(token_file=params.token_file)
@@ -1013,6 +1068,20 @@ def run(rank, world_size, args):
         train_cuts = datamodule.train_libritts_cuts()
         train_cuts = train_cuts.filter(_remove_short_and_long_utt)
         dev_cuts = datamodule.dev_libritts_cuts()
+    # 新增：支持 LibriTTS 子集 ------------------------------------------------------------------
+    elif params.dataset == "libritts-clean100":
+        train_cuts = datamodule.train_libritts_clean100_cuts()
+        train_cuts = train_cuts.filter(_remove_short_and_long_utt)
+        dev_cuts = datamodule.dev_libritts_cuts()
+    elif params.dataset == "libritts-clean360":
+        train_cuts = datamodule.train_libritts_clean360_cuts()
+        train_cuts = train_cuts.filter(_remove_short_and_long_utt)
+        dev_cuts = datamodule.dev_libritts_cuts()
+    elif params.dataset == "libritts-other500":
+        train_cuts = datamodule.train_libritts_other500_cuts()
+        train_cuts = train_cuts.filter(_remove_short_and_long_utt)
+        dev_cuts = datamodule.dev_libritts_cuts()
+    #---------------------------------------------------------------------------------------------------------------
     else:
         assert params.dataset == "custom"
         train_cuts = datamodule.train_custom_cuts(params.train_manifest)
