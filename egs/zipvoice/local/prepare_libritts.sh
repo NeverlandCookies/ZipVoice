@@ -46,8 +46,8 @@ if [ $stage -le 1 ] && [ $stop_stage -ge 1 ]; then
   # We assume that you have downloaded the LibriTTS corpus
   # to $dl_dir/LibriTTS
 
-  # We did not add tokens to this manifest, as on-the-fly 
-  # tokenization with LibriTTSTokenizer is not slow.
+  # We did not add tokens to this manifest, as S3 tokens will be added
+  # during feature extraction in Stage 2.
   mkdir -p data/manifests
   if [ ! -e data/manifests/.libritts.done ]; then
     lhotse prepare libritts --num-jobs ${nj} $dl_dir/LibriTTS data/manifests
@@ -56,45 +56,45 @@ if [ $stage -le 1 ] && [ $stop_stage -ge 1 ]; then
 fi
 
 if [ $stage -le 2 ] && [ $stop_stage -ge 2 ]; then
-  log "Stage 2: Compute Fbank for LibriTTS"
-  mkdir -p data/fbank
+  log "Stage 2: Compute Fbank for LibriTTS with S3 Tokenizer"
+  mkdir -p data/s3_fbank
 
-  if [ ! -e data/fbank/.libritts.done ]; then
+  if [ ! -e data/s3_fbank/.libritts.done ]; then
     for subset in train-clean-100 train-clean-360 train-other-500 dev-clean test-clean; do
       python3 -m zipvoice.bin.compute_fbank \
         --source-dir data/manifests \
-        --dest-dir data/fbank \
+        --dest-dir data/s3_fbank \
         --dataset libritts \
         --subset ${subset} \
         --sampling-rate $sampling_rate \
+        --type vocos \
         --num-jobs ${nj}
     done
-    touch data/fbank/.libritts.done
+    touch data/s3_fbank/.libritts.done
   fi
 
   # Here we shuffle and combine the train-clean-100, train-clean-360 and
   # train-other-500 together to form the training set.
-  if [ ! -f data/fbank/libritts_cuts_train-all-shuf.jsonl.gz ]; then
-    cat <(gunzip -c data/fbank/libritts_cuts_train-clean-100.jsonl.gz) \
-      <(gunzip -c data/fbank/libritts_cuts_train-clean-360.jsonl.gz) \
-      <(gunzip -c data/fbank/libritts_cuts_train-other-500.jsonl.gz) | \
-      shuf | gzip -c > data/fbank/libritts_cuts_train-all-shuf.jsonl.gz
+  if [ ! -f data/s3_fbank/libritts_cuts_train-all-shuf.jsonl.gz ]; then
+    cat <(gunzip -c data/s3_fbank/libritts_cuts_train-clean-100.jsonl.gz) \
+      <(gunzip -c data/s3_fbank/libritts_cuts_train-clean-360.jsonl.gz) \
+      <(gunzip -c data/s3_fbank/libritts_cuts_train-other-500.jsonl.gz) | \
+      shuf | gzip -c > data/s3_fbank/libritts_cuts_train-all-shuf.jsonl.gz
   fi
 
 
-  if [ ! -e data/fbank/.libritts-validated.done ]; then
-    log "Validating data/fbank for LibriTTS"
+  if [ ! -e data/s3_fbank/.libritts-validated.done ]; then
+    log "Validating data/s3_fbank for LibriTTS (with S3 tokens)"
     python3 ./utils/validate_manifest.py \
-      data/fbank/libritts_cuts_train-all-shuf.jsonl.gz
-    touch data/fbank/.libritts-validated.done
+      data/s3_fbank/libritts_cuts_train-all-shuf.jsonl.gz
+    touch data/s3_fbank/.libritts-validated.done
   fi
 fi
 
 if [ $stage -le 3 ] && [ $stop_stage -ge 3 ]; then
-  log "Stage 3: Generate token file"
-  if [ ! -e data/tokens_libritts.txt ]; then
-    python3 ./local/prepare_token_file_char.py \
-      --manifest data/fbank/libritts_cuts_train-all-shuf.jsonl.gz \
-      --tokens data/tokens_libritts.txt
+  log "Stage 3: Generate token file (for compatibility, S3Tokenizer doesn't need this)"
+  if [ ! -e data/tokens_s3.txt ]; then
+    echo "# S3Tokenizer doesn't require a token file" > data/tokens_s3.txt
+    echo "# vocab_size and pad_id are automatically obtained from S3Tokenizer" >> data/tokens_s3.txt
   fi
 fi

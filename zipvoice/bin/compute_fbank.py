@@ -39,10 +39,12 @@ from pathlib import Path
 
 import lhotse
 import torch
-from lhotse import CutSet, LilcomChunkyWriter, load_manifest_lazy
+from lhotse import CutSet, LilcomChunkyWriter, load_manifest_lazy, Fbank, FbankConfig, split_parallelize_combine
+from functools import partial
 
 from zipvoice.utils.common import str2bool
 from zipvoice.utils.feature import VocosFbank
+from zipvoice.tokenizer.s3_tokenizer import add_tokens
 
 # Torch's multithreaded behavior needs to be disabled or
 # it wastes a lot of CPU and slow things down.
@@ -237,6 +239,13 @@ def compute_fbank(params):
             supervisions=supervisions,
         )
 
+    _add_tokens = partial(add_tokens, tokenizer="s3")
+    logging.info("Adding tokens")
+
+    cut_set = split_parallelize_combine(
+        num_jobs=num_jobs, manifest=cut_set, fn=_add_tokens
+    )
+    
     cut_set = cut_set.resample(params.sampling_rate)
     if params.type == "vocos":
         extractor = VocosFbank()

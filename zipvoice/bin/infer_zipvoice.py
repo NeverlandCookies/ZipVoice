@@ -73,6 +73,10 @@ from zipvoice.tokenizer.tokenizer import (
     LibriTTSTokenizer,
     SimpleTokenizer,
 )
+
+# ===== 新增: 导入 S3SpeechTokenizer =====
+from zipvoice.tokenizer.s3_tokenizer import S3SpeechTokenizer
+
 from zipvoice.utils.checkpoint import load_checkpoint
 from zipvoice.utils.common import AttributeDict
 from zipvoice.utils.feature import VocosFbank
@@ -92,8 +96,8 @@ def get_parser():
     parser.add_argument(
         "--model-name",
         type=str,
-        default="zipvoice",
-        choices=["zipvoice", "zipvoice_distill"],
+        default="zipvoice_s3",  # ===== 修改：默认改为 zipvoice_s3 =====
+        choices=["zipvoice", "zipvoice_distill", "zipvoice_s3"],  # ===== 添加 zipvoice_s3 =====
         help="The model used for inference",
     )
 
@@ -116,7 +120,7 @@ def get_parser():
     parser.add_argument(
         "--vocoder-path",
         type=str,
-        default=None,
+        default="/dkucc/home/tp286/ZipVC/models/vocos-mel-24khz",
         help="The vocoder checkpoint. "
         "Will download pre-trained vocoder from huggingface if not specified.",
     )
@@ -124,8 +128,8 @@ def get_parser():
     parser.add_argument(
         "--tokenizer",
         type=str,
-        default="emilia",
-        choices=["emilia", "libritts", "espeak", "simple"],
+        default="s3",  # ===== 修改：默认改为 s3 =====
+        choices=["emilia", "libritts", "espeak", "simple", "s3"],  # ===== 添加 "s3" =====
         help="Tokenizer type.",
     )
 
@@ -137,34 +141,27 @@ def get_parser():
         "https://github.com/rhasspy/espeak-ng/blob/master/docs/languages.md",
     )
 
+    # ===== 修改2: 将文本相关参数改为 VC 相关参数 =====
     parser.add_argument(
         "--test-list",
         type=str,
         default=None,
-        help="The list of prompt speech, prompt_transcription, "
-        "and text to synthesizein the format of "
-        "'{wav_name}\t{prompt_transcription}\t{prompt_wav}\t{text}'.",
+        help="The list of source and target wav files in the format of "
+        "'{wav_name}\t{source_wav}\t{target_wav}'.",
     )
 
     parser.add_argument(
-        "--prompt-wav",
+        "--source-wav",
         type=str,
         default=None,
-        help="The prompt wav to mimic",
+        help="The source wav file for voice conversion (content source)",
     )
 
     parser.add_argument(
-        "--prompt-text",
+        "--target-wav",
         type=str,
         default=None,
-        help="The transcription of the prompt wav",
-    )
-
-    parser.add_argument(
-        "--text",
-        type=str,
-        default=None,
-        help="The text to synthesize",
+        help="The target wav file to mimic the voice (speaker reference)",
     )
 
     parser.add_argument(
@@ -253,14 +250,13 @@ def get_vocoder(vocos_local_path: Optional[str] = None):
     return vocoder
 
 
-def generate_sentence(
+def generate_vc_sentence(
     save_path: str,
-    prompt_text: str,
-    prompt_wav: str,
-    text: str,
+    source_wav: str,
+    target_wav: str,
     model: torch.nn.Module,
     vocoder: torch.nn.Module,
-    tokenizer: EmiliaTokenizer,
+    tokenizer: S3SpeechTokenizer,
     feature_extractor: VocosFbank,
     device: torch.device,
     num_step: int = 16,
@@ -272,59 +268,52 @@ def generate_sentence(
     sampling_rate: int = 24000,
 ):
     """
-    Generate waveform of a text based on a given prompt
-        waveform and its transcription.
+    Generate waveform for voice conversion based on source and target wav files.
 
     Args:
         save_path (str): Path to save the generated wav.
-        prompt_text (str): Transcription of the prompt wav.
-        prompt_wav (str): Path to the prompt wav file.
-        text (str): Text to be synthesized into a waveform.
-        model (torch.nn.Module): The model used for generation.
+        source_wav (str): Path to the source wav file (content source).
+        target_wav (str): Path to the target wav file (speaker reference).
+        model (torch.nn.Module): The ZipVoice model used for generation.
         vocoder (torch.nn.Module): The vocoder used to convert features to waveforms.
-        tokenizer (EmiliaTokenizer): The tokenizer used to convert text to tokens.
-        feature_extractor (VocosFbank): The feature extractor used to
-            extract acoustic features.
+        tokenizer (S3SpeechTokenizer): The S3 tokenizer used to extract content tokens.
+        feature_extractor (VocosFbank): The feature extractor used to extract acoustic features.
         device (torch.device): The device on which computations are performed.
         num_step (int, optional): Number of steps for decoding. Defaults to 16.
-        guidance_scale (float, optional): Scale for classifier-free guidance.
-            Defaults to 1.0.
+        guidance_scale (float, optional): Scale for classifier-free guidance. Defaults to 1.0.
         speed (float, optional): Speed control. Defaults to 1.0.
         t_shift (float, optional): Time shift. Defaults to 0.5.
-        target_rms (float, optional): Target RMS for waveform normalization.
-            Defaults to 0.1.
-        feat_scale (float, optional): Scale for features.
-            Defaults to 0.1.
-        sampling_rate (int, optional): Sampling rate for the waveform.
-            Defaults to 24000.
+        target_rms (float, optional): Target RMS for waveform normalization. Defaults to 0.1.
+        feat_scale (float, optional): Scale for features. Defaults to 0.1.
+        sampling_rate (int, optional): Sampling rate for the waveform. Defaults to 24000.
     Returns:
-        metrics (dict): Dictionary containing time and real-time
-            factor metrics for processing.
+        metrics (dict): Dictionary containing time and real-time factor metrics.
     """
-    # Convert text to tokens
-    tokens = tokenizer.texts_to_token_ids([text])
-    prompt_tokens = tokenizer.texts_to_token_ids([prompt_text])
+    logging.info(f"Extracting S3 tokens from source wav: {source_wav}")
+    source_tokens = tokenizer.speech_to_token_ids([source_wav])  
 
-    # Load and preprocess prompt wav
-    prompt_wav, prompt_sampling_rate = torchaudio.load(prompt_wav)
+    logging.info(f"Extracting VocosFbank features from target wav: {target_wav}")
+    target_wav_data, target_sampling_rate = torchaudio.load(target_wav)
 
-    if prompt_sampling_rate != sampling_rate:
+    if target_sampling_rate != sampling_rate:
         resampler = torchaudio.transforms.Resample(
-            orig_freq=prompt_sampling_rate, new_freq=sampling_rate
+            orig_freq=target_sampling_rate, new_freq=sampling_rate
         )
-        prompt_wav = resampler(prompt_wav)
+        target_wav_data = resampler(target_wav_data)
+    
+    target_rms_val = torch.sqrt(torch.mean(torch.square(target_wav_data)))
+    if target_rms_val < target_rms:
+        target_wav_data = target_wav_data * target_rms / target_rms_val
 
-    prompt_rms = torch.sqrt(torch.mean(torch.square(prompt_wav)))
-    if prompt_rms < target_rms:
-        prompt_wav = prompt_wav * target_rms / prompt_rms
-
-    # Extract features from prompt wav
-    prompt_features = feature_extractor.extract(
-        prompt_wav, sampling_rate=sampling_rate
+    target_features = feature_extractor.extract(
+        target_wav_data, sampling_rate=sampling_rate
     ).to(device)
+    
+    target_features = target_features.unsqueeze(0) * feat_scale
+    target_features_lens = torch.tensor([target_features.size(1)], device=device)
 
-    prompt_features = prompt_features.unsqueeze(0) * feat_scale
-    prompt_features_lens = torch.tensor([prompt_features.size(1)], device=device)
+    logging.info(f"Extracting S3 tokens from target wav: {target_wav}")
+    target_tokens = tokenizer.speech_to_token_ids([target_wav])
 
     # Start timing
     start_t = dt.datetime.now()
@@ -336,10 +325,10 @@ def generate_sentence(
         pred_prompt_features,
         pred_prompt_features_lens,
     ) = model.sample(
-        tokens=tokens,
-        prompt_tokens=prompt_tokens,
-        prompt_features=prompt_features,
-        prompt_features_lens=prompt_features_lens,
+        tokens=source_tokens,  # ===== 源语音的 S3 token IDs =====
+        prompt_tokens=target_tokens,  # ===== 目标语音的 S3 token IDs（作为 prompt） =====
+        prompt_features=target_features,  # ===== 目标语音的 VocosFbank 特征 =====
+        prompt_features_lens=target_features_lens,  # ===== 目标语音的 VocosFbank 特征长度 =====
         speed=speed,
         t_shift=t_shift,
         duration="predict",
@@ -380,12 +369,12 @@ def generate_sentence(
     return metrics
 
 
-def generate_list(
+def generate_vc_list(
     res_dir: str,
     test_list: str,
     model: torch.nn.Module,
     vocoder: torch.nn.Module,
-    tokenizer: EmiliaTokenizer,
+    tokenizer: S3SpeechTokenizer,
     feature_extractor: VocosFbank,
     device: torch.device,
     num_step: int = 16,
@@ -405,13 +394,12 @@ def generate_list(
         lines = fr.readlines()
 
     for i, line in enumerate(lines):
-        wav_name, prompt_text, prompt_wav, text = line.strip().split("\t")
+        wav_name, source_wav, target_wav = line.strip().split("\t")
         save_path = f"{res_dir}/{wav_name}.wav"
-        metrics = generate_sentence(
+        metrics = generate_vc_sentence(
             save_path=save_path,
-            prompt_text=prompt_text,
-            prompt_wav=prompt_wav,
-            text=text,
+            source_wav=source_wav,
+            target_wav=target_wav,
             model=model,
             vocoder=vocoder,
             tokenizer=tokenizer,
@@ -460,6 +448,10 @@ def main():
             "num_step": 8,
             "guidance_scale": 3.0,
         },
+        "zipvoice_s3": {  # ===== 新增 =====
+            "num_step": 16,
+            "guidance_scale": 1.0,
+        },
     }
 
     model_specific_defaults = model_defaults.get(params.model_name, {})
@@ -469,23 +461,30 @@ def main():
             setattr(params, param, value)
             logging.info(f"Setting {param} to default value: {value}")
 
+    # ===== 修改6: 更新输入验证逻辑 =====
     assert (params.test_list is not None) ^ (
-        (params.prompt_wav and params.prompt_text and params.text) is not None
+        (params.source_wav and params.target_wav) is not None
     ), (
-        "For inference, please provide prompts and text with either '--test-list'"
-        " or '--prompt-wav, --prompt-text and --text'."
+        "For VC inference, please provide source and target wav files with either '--test-list'"
+        " or '--source-wav and --target-wav'."
     )
 
     if params.model_dir is not None:
         params.model_dir = Path(params.model_dir)
         if not params.model_dir.is_dir():
             raise FileNotFoundError(f"{params.model_dir} does not exist")
-        for filename in [params.checkpoint_name, "model.json", "tokens.txt"]:
+
+        if params.tokenizer == "s3":
+            required_files = [params.checkpoint_name, "model.json"]
+        else:
+            required_files = [params.checkpoint_name, "model.json", "tokens.txt"]
+
+        for filename in required_files:
             if not (params.model_dir / filename).is_file():
                 raise FileNotFoundError(f"{params.model_dir / filename} does not exist")
         model_ckpt = params.model_dir / params.checkpoint_name
         model_config = params.model_dir / "model.json"
-        token_file = params.model_dir / "tokens.txt"
+        token_file = params.model_dir / "tokens.txt" if params.tokenizer != "s3" else None
         logging.info(
             f"Using local model dir {params.model_dir}, "
             f"checkpoint {params.checkpoint_name}"
@@ -512,6 +511,8 @@ def main():
         tokenizer = LibriTTSTokenizer(token_file=token_file)
     elif params.tokenizer == "espeak":
         tokenizer = EspeakTokenizer(token_file=token_file, lang=params.lang)
+    elif params.tokenizer == "s3":  # ===== 新增 =====
+        tokenizer = S3SpeechTokenizer()
     else:
         assert params.tokenizer == "simple"
         tokenizer = SimpleTokenizer(token_file=token_file)
@@ -521,7 +522,7 @@ def main():
     with open(model_config, "r") as f:
         model_config = json.load(f)
 
-    if params.model_name == "zipvoice":
+    if params.model_name == "zipvoice" or params.model_name == "zipvoice_s3":
         model = ZipVoice(
             **model_config["model"],
             **tokenizer_config,
@@ -566,7 +567,7 @@ def main():
     logging.info("Start generating...")
     if params.test_list:
         os.makedirs(params.res_dir, exist_ok=True)
-        generate_list(
+        generate_vc_list(
             res_dir=params.res_dir,
             test_list=params.test_list,
             model=model,
@@ -583,11 +584,10 @@ def main():
             sampling_rate=params.sampling_rate,
         )
     else:
-        generate_sentence(
+        generate_vc_sentence(
             save_path=params.res_wav_path,
-            prompt_text=params.prompt_text,
-            prompt_wav=params.prompt_wav,
-            text=params.text,
+            source_wav=params.source_wav,
+            target_wav=params.target_wav,
             model=model,
             vocoder=vocoder,
             tokenizer=tokenizer,

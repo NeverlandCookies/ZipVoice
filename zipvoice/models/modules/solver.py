@@ -100,7 +100,10 @@ class DiffusionModel(torch.nn.Module):
             data_uncond, data_cond = self.model_func(
                 t=t,
                 xt=x,
+                # for ZipVoice(s3)
                 text_condition=text_condition,
+                # for ZipVC
+                # content_condition=text_condition,
                 speech_condition=speech_condition,
                 padding_mask=padding_mask,
                 **kwargs

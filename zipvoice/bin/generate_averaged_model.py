@@ -40,6 +40,9 @@ from zipvoice.models.zipvoice import ZipVoice
 from zipvoice.models.zipvoice_dialog import ZipVoiceDialog, ZipVoiceDialogStereo
 from zipvoice.models.zipvoice_distill import ZipVoiceDistill
 from zipvoice.tokenizer.tokenizer import SimpleTokenizer
+
+from zipvoice.tokenizer.s3_tokenizer import S3SpeechTokenizer
+
 from zipvoice.utils.checkpoint import (
     average_checkpoints_with_averaged_model,
     find_checkpoints,
@@ -96,6 +99,7 @@ def get_parser():
             "zipvoice_distill",
             "zipvoice_dialog",
             "zipvoice_dialog_stereo",
+            "zipvoice_s3",  # ===== 新增：S3 tokenizer 版本 =====
         ],
         help="The model type to be averaged. ",
     )
@@ -114,21 +118,29 @@ def main():
     with open(params.exp_dir / "model.json", "r") as f:
         model_config = json.load(f)
 
-    # Any tokenizer can be used here.
-    # Use SimpleTokenizer for simplicity.
-    tokenizer = SimpleTokenizer(token_file=params.exp_dir / "tokens.txt")
-    if params.model_name in ["zipvoice", "zipvoice_distill"]:
+    if params.model_name == "zipvoice_s3":
+        
+        logging.info("Using S3SpeechTokenizer for zipvoice_s3")
+        tokenizer = S3SpeechTokenizer(device="cpu")  
         tokenizer_config = {
             "vocab_size": tokenizer.vocab_size,
             "pad_id": tokenizer.pad_id,
         }
-    elif params.model_name in ["zipvoice_dialog", "zipvoice_dialog_stereo"]:
-        tokenizer_config = {
-            "vocab_size": tokenizer.vocab_size,
-            "pad_id": tokenizer.pad_id,
-            "spk_a_id": tokenizer.spk_a_id,
-            "spk_b_id": tokenizer.spk_b_id,
-        }
+        logging.info(f"S3 tokenizer config: vocab_size={tokenizer.vocab_size}, pad_id={tokenizer.pad_id}")
+    else:
+        tokenizer = SimpleTokenizer(token_file=params.exp_dir / "tokens.txt")
+        if params.model_name in ["zipvoice", "zipvoice_distill"]:
+            tokenizer_config = {
+                "vocab_size": tokenizer.vocab_size,
+                "pad_id": tokenizer.pad_id,
+            }
+        elif params.model_name in ["zipvoice_dialog", "zipvoice_dialog_stereo"]:
+            tokenizer_config = {
+                "vocab_size": tokenizer.vocab_size,
+                "pad_id": tokenizer.pad_id,
+                "spk_a_id": tokenizer.spk_a_id,
+                "spk_b_id": tokenizer.spk_b_id,
+            }
 
     params.suffix = f"epoch-{params.epoch}-avg-{params.avg}"
 
@@ -139,6 +151,11 @@ def main():
 
     logging.info("About to create model")
     if params.model_name == "zipvoice":
+        model = ZipVoice(
+            **model_config["model"],
+            **tokenizer_config,
+        )
+    elif params.model_name == "zipvoice_s3":
         model = ZipVoice(
             **model_config["model"],
             **tokenizer_config,
