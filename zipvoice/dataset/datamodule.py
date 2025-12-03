@@ -312,6 +312,27 @@ class TtsDataModule:
         )
 
     @lru_cache()
+    def train_libritts_clean100_cuts(self) -> CutSet:
+        logging.info("About to get train-clean-100 cuts only")
+        return load_manifest_lazy(
+            self.args.manifest_dir / "libritts_cuts_train-clean-100.jsonl.gz"
+        )
+
+    @lru_cache()
+    def train_libritts_clean360_cuts(self) -> CutSet:
+        logging.info("About to get train-clean-360 cuts only")
+        return load_manifest_lazy(
+            self.args.manifest_dir / "libritts_cuts_train-clean-360.jsonl.gz"
+        )
+
+    @lru_cache()
+    def train_libritts_other500_cuts(self) -> CutSet:
+        logging.info("About to get train-other-500 cuts only")
+        return load_manifest_lazy(
+            self.args.manifest_dir / "libritts_cuts_train-other-500.jsonl.gz"
+        )
+
+    @lru_cache()
     def dev_libritts_cuts(self) -> CutSet:
         logging.info("About to get dev-clean cuts")
         return load_manifest_lazy(

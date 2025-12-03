@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # Copyright    2025  Xiaomi Corp.        (authors:  Han Zhu)
 #
+# Modified for Voice Conversion evaluation with S3 tokenizer
+# Additions: Detailed score saving functionality
+#
 # See ../../../../LICENSE for clarification regarding multiple authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,11 +20,13 @@
 
 """
 Calculate UTMOS score with automatic Mean Opinion Score (MOS) prediction system
+
+Modified for Voice Conversion: Saves detailed UTMOS scores for each audio file.
 """
 import argparse
 import logging
 import os
-from typing import List
+from typing import List, Tuple
 
 import numpy as np
 import torch
@@ -46,12 +51,18 @@ def get_parser() -> argparse.ArgumentParser:
         "--model-dir",
         type=str,
         required=True,
-        help="Local path of our evaluatioin model repository."
-        "Download from https://huggingface.co/k2-fsa/TTS_eval_models."
-        "Will use 'tts_eval_models/mos/utmos22_strong_step7459_v1.pt'"
-        " in this script",
+        help="Local path of our evaluation model repository. "
+        "Download from https://huggingface.co/k2-fsa/TTS_eval_models. "
+        "Will use 'tts_eval_models/mos/utmos22_strong_step7459_v1.pt' "
+        "in this script",
     )
-
+    parser.add_argument(
+        "--output-path",
+        type=str,
+        default=None,
+        help="Path to save detailed UTMOS scores for each audio file. "
+        "If not specified, only the average score will be printed.",
+    )
     parser.add_argument(
         "--extension",
         type=str,
@@ -112,32 +123,71 @@ class UTMOSScore:
 
         return scores
 
-    def score_dir(self, dir_path: str, extension: str) -> float:
+    def score_dir(
+        self, 
+        dir_path: str, 
+        extension: str, 
+        output_path: str = None
+    ) -> Tuple[float, List[Tuple[str, float]]]:
         """
         Computes the average UTMOS score for all files in a directory.
 
         Args:
             dir_path (str): Path to the directory containing audio files.
+            extension (str): File extension of the audio files.
+            output_path (str, optional): Path to save detailed scores.
 
         Returns:
-            float: Average UTMOS score for the directory.
+            Tuple[float, List[Tuple[str, float]]]:
+                - Average UTMOS score for the directory
+                - List of (wav_name, utmos_score) tuples
         """
         logging.info(f"Calculating UTMOS score for {dir_path}")
 
-        # Get list of wav files
-        wav_files = [
+        # Get list of wav files (sorted for consistency)
+        # wav_files = sorted([
+        #     os.path.join(dir_path, f)
+        #     for f in os.listdir(dir_path)
+        #     if f.lower().endswith(f".{extension}")
+        # ])
+
+        wav_files = sorted([
             os.path.join(dir_path, f)
             for f in os.listdir(dir_path)
-            if f.lower().endswith(extension)
-        ]
+            if f.lower().endswith(f".{extension}") and not f.lower().endswith("_source.wav")  # 过滤掉 source 文件
+        ])
+        
 
         if not wav_files:
-            raise ValueError(f"No audio files found in {dir_path}")
+            raise ValueError(f"No .{extension} files found in {dir_path}")
+
+        logging.info(f"Found {len(wav_files)} audio files")
 
         # Compute scores
         scores = self.score_files(wav_files)
 
-        return float(np.mean(scores))
+        # Extract wav names (without extension)
+        wav_names = [
+            os.path.splitext(os.path.basename(f))[0] for f in wav_files
+        ]
+
+        # Combine wav names with scores
+        detailed_results = list(zip(wav_names, scores))
+
+        # Save detailed scores if output path is provided
+        if output_path:
+            output_dir = os.path.dirname(output_path)
+            if output_dir and not os.path.exists(output_dir):
+                os.makedirs(output_dir)
+
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write("wav_name\tutmos\n")
+                for wav_name, score in detailed_results:
+                    f.write(f"{wav_name}\t{score:.4f}\n")
+
+            logging.info(f"Detailed UTMOS scores saved to: {output_path}")
+
+        return float(np.mean(scores)), detailed_results
 
 
 if __name__ == "__main__":
@@ -168,7 +218,13 @@ if __name__ == "__main__":
     utmos_evaluator = UTMOSScore(model_path)
 
     # Compute UTMOS score
-    score = utmos_evaluator.score_dir(args.wav_path, args.extension)
+    avg_score, detailed_results = utmos_evaluator.score_dir(
+        args.wav_path, 
+        args.extension,
+        args.output_path
+    )
+    
     print("-" * 50)
-    logging.info(f"UTMOS score: {score:.2f}")
+    logging.info(f"UTMOS score: {avg_score:.4f}")
     print("-" * 50)
+

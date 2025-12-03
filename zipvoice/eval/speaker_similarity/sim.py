@@ -19,12 +19,14 @@
 """
 Computes speaker similarity (SIM-o) using a WavLM-based
     ECAPA-TDNN speaker verification model.
+    
+Modified for Voice Conversion: Supports VC test format and saves detailed scores.
 """
 import argparse
 import logging
 import os
 import warnings
-from typing import List
+from typing import List, Tuple
 
 import numpy as np
 import torch
@@ -38,33 +40,40 @@ warnings.filterwarnings("ignore")
 
 def get_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Calculate speaker similarity (SIM-o) score."
+        description="Calculate speaker similarity (SIM-o) score for Voice Conversion."
     )
 
     parser.add_argument(
         "--wav-path",
         type=str,
         required=True,
-        help="Path to the directory containing evaluated speech files.",
+        help="Path to the directory containing evaluated speech files (converted audio).",
     )
     parser.add_argument(
         "--test-list",
         type=str,
         required=True,
-        help="Path to the file list that contains the correspondence between prompts "
-        "and evaluated speech. Each line contains (audio_name, prompt_text_1, "
-        "prompt_text_2, prompt_audio_1, prompt_audio_2, text) separated by tabs.",
+        help="Path to the test list file. For VC, each line contains "
+        "(wav_name, source_wav, target_wav) or "
+        "(wav_name, source_wav, target_wav, source_gender, target_gender) "
+        "separated by tabs.",
     )
     parser.add_argument(
         "--model-dir",
         type=str,
         required=True,
-        help="Local path of our evaluatioin model repository."
-        "Download from https://huggingface.co/k2-fsa/TTS_eval_models."
-        "Will use 'tts_eval_models/speaker_similarity/wavlm_large_finetune.pth'"
+        help="Local path of our evaluation model repository. "
+        "Download from https://huggingface.co/k2-fsa/TTS_eval_models. "
+        "Will use 'tts_eval_models/speaker_similarity/wavlm_large_finetune.pth' "
         "and 'tts_eval_models/speaker_similarity/wavlm_large/' in this script",
     )
-
+    parser.add_argument(
+        "--output-path",
+        type=str,
+        default=None,
+        help="Path to save detailed similarity scores for each test pair. "
+        "If not specified, only the average score will be printed.",
+    )
     parser.add_argument(
         "--extension",
         type=str,
@@ -134,20 +143,31 @@ class SpeakerSimilarity:
 
         return embeddings
 
-    def score(self, wav_path: str, extension: str, test_list: str) -> float:
+    def score(
+        self, 
+        wav_path: str, 
+        extension: str, 
+        test_list: str, 
+        output_path: str = None
+    ) -> Tuple[float, List[Tuple[str, float]]]:
         """
-        Computes the Speaker Similarity (SIM-o) score between reference and
-            evaluated speech.
+        Computes the Speaker Similarity (SIM-o) score between target and
+            converted speech for Voice Conversion.
 
         Args:
-            wav_path (str): Path to the directory containing evaluated speech files.
-            test_list (str): Path to the test list file mapping evaluated files
-                to reference prompts.
+            wav_path (str): Path to the directory containing converted speech files.
+            extension (str): File extension of the audio files.
+            test_list (str): Path to the test list file. For VC, format is:
+                {wav_name}\t{source_wav}\t{target_wav}[\t{source_gender}\t{target_gender}]
+            output_path (str, optional): Path to save detailed scores.
 
         Returns:
-            float: Average similarity score between reference and evaluated embeddings.
+            Tuple[float, List[Tuple[str, float]]]: 
+                - Average similarity score
+                - List of (wav_name, similarity_score) tuples
         """
         logging.info(f"Calculating Speaker Similarity (SIM-o) score for {wav_path}")
+        
         # Read test pairs
         try:
             with open(test_list, "r", encoding="utf-8") as f:
@@ -158,43 +178,78 @@ class SpeakerSimilarity:
 
         if not lines:
             raise ValueError(f"Test list {test_list} is empty or malformed")
-        # Parse test pairs
-        prompt_wavs = []
-        eval_wavs = []
+        
+        # Parse test pairs (support both 3-field and 5-field formats)
+        target_wavs = []  # Reference speaker audio (target_wav in VC)
+        eval_wavs = []    # Converted audio
+        wav_names = []
+        
         for line in lines:
-            if len(line) != 4:
-                raise ValueError(f"Invalid line: {line}")
-            wav_name, prompt_text, prompt_wav, text = line
+            if len(line) == 3:
+                # Format: wav_name, source_wav, target_wav
+                wav_name, source_wav, target_wav = line
+            elif len(line) == 5:
+                # Format: wav_name, source_wav, target_wav, source_gender, target_gender
+                wav_name, source_wav, target_wav, source_gender, target_gender = line
+            else:
+                raise ValueError(
+                    f"Invalid line format (expected 3 or 5 fields): {line}"
+                )
+            
+            # For VC similarity: compare converted audio with target speaker
             eval_wav_path = os.path.join(wav_path, f"{wav_name}.{extension}")
+            
             # Validate file existence
-            if not os.path.exists(prompt_wav):
-                raise FileNotFoundError(f"Prompt file not found: {prompt_wav}")
+            if not os.path.exists(target_wav):
+                raise FileNotFoundError(f"Target file not found: {target_wav}")
             if not os.path.exists(eval_wav_path):
-                raise FileNotFoundError(f"Evaluated file not found: {eval_wav_path}")
-            prompt_wavs.append(prompt_wav)
+                raise FileNotFoundError(f"Converted file not found: {eval_wav_path}")
+            
+            target_wavs.append(target_wav)
             eval_wavs.append(eval_wav_path)
-        logging.info(f"Found {len(prompt_wavs)} valid test pairs")
+            wav_names.append(wav_name)
+        
+        logging.info(f"Found {len(target_wavs)} valid test pairs")
+        
         # Extract embeddings
-
-        prompt_embeddings = self.get_embeddings(prompt_wavs)
+        target_embeddings = self.get_embeddings(target_wavs)
         eval_embeddings = self.get_embeddings(eval_wavs)
 
-        if len(prompt_embeddings) != len(eval_embeddings):
+        if len(target_embeddings) != len(eval_embeddings):
             raise RuntimeError(
-                f"Mismatch: {len(prompt_embeddings)} prompt vs "
-                f" {len(eval_embeddings)} eval embeddings"
+                f"Mismatch: {len(target_embeddings)} target vs "
+                f"{len(eval_embeddings)} eval embeddings"
             )
 
         # Calculate similarity scores
         scores = []
-        for prompt_emb, eval_emb in zip(prompt_embeddings, eval_embeddings):
+        detailed_results = []
+        
+        for wav_name, target_emb, eval_emb in zip(
+            wav_names, target_embeddings, eval_embeddings
+        ):
             # Compute cosine similarity
             similarity = torch.nn.functional.cosine_similarity(
-                prompt_emb, eval_emb, dim=-1
+                target_emb, eval_emb, dim=-1
             )
-            scores.append(similarity.item())
+            score = similarity.item()
+            scores.append(score)
+            detailed_results.append((wav_name, score))
 
-        return float(np.mean(scores))
+        # Save detailed scores if output path is provided
+        if output_path:
+            output_dir = os.path.dirname(output_path)
+            if output_dir and not os.path.exists(output_dir):
+                os.makedirs(output_dir)
+            
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write("wav_name\tsimilarity\n")
+                for wav_name, score in detailed_results:
+                    f.write(f"{wav_name}\t{score:.6f}\n")
+            
+            logging.info(f"Detailed similarity scores saved to: {output_path}")
+
+        return float(np.mean(scores)), detailed_results
 
 
 if __name__ == "__main__":
@@ -223,7 +278,14 @@ if __name__ == "__main__":
         sv_model_path=sv_model_path, ssl_model_path=ssl_model_path
     )
     # Compute similarity score
-    score = sim_evaluator.score(args.wav_path, args.extension, args.test_list)
+    avg_score, detailed_results = sim_evaluator.score(
+        args.wav_path, 
+        args.extension, 
+        args.test_list,
+        args.output_path
+    )
+    
     print("-" * 50)
-    logging.info(f"SIM-o score: {score:.3f}")
+    logging.info(f"SIM-o score: {avg_score:.4f}")
     print("-" * 50)
+
